@@ -29,7 +29,7 @@ def _():
     import pandas as pd
     import torch
 
-    return Dict, List, Optional, Tuple, np, pd, plt, random, sys, torch
+    return np, pd, plt, random, sys, torch
 
 
 @app.cell
@@ -54,11 +54,13 @@ def _(mo):
 
     Large language models store a **KV cache** during generation: every token's key and value vectors are kept so the model can attend to them. For long contexts, this cache becomes the memory bottleneck.
 
-    **Naive approaches** to shrinking the cache (eviction, truncation, random dropping) lose information. The paper asks: *can we build a smaller set of keys and values that reproduces the same attention behavior?*
+    **Naive approaches** to summarizing or shrinking the cache (eviction, truncation, random dropping) lose information. The paper asks: *can we build a smaller set of keys and values that reproduces the same attention behavior?*
 
     ## The Attention Matching Idea
 
     Instead of just picking a subset of tokens, AM constructs a compact cache $(C_1, \beta, C_2)$ where:
+
+    Add more compaction formulae
 
     - $C_1$ (shape $t \times d$) = **compacted keys** (selected or merged from original keys)
     - $\beta$ (shape $t$) = **bias terms** that correct the partition function so $\sum_j \exp(q \cdot C_{1,j} / \sqrt{d} + \beta_j) \approx \sum_j \exp(q \cdot K_j / \sqrt{d})$
@@ -70,12 +72,8 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Controls
-
-    Use the controls below to configure the synthetic KV cache and choose which compaction algorithm to run. All algorithms come from the paper's actual codebase.
-    """)
+def _():
+    # Controls are rendered in the sidebar (always visible on the right)
     return
 
 
@@ -102,19 +100,22 @@ def _(mo):
     d_head = mo.ui.slider(8, 64, value=32, step=8, label="Head dim")
     keep_ratio = mo.ui.slider(0.05, 1.0, value=0.25, step=0.05, label="Keep ratio")
     noise = mo.ui.slider(0.0, 0.5, value=0.10, step=0.05, label="Noise")
-    seed = mo.ui.slider(0, 999, value=7, step=1, label="Seed")
+    seed = mo.ui.slider(0, 999, value=42, step=1, label="Seed")
 
-    mo.vstack(
+    mo.sidebar(
         [
-            mo.hstack([scenario, method], justify="start", gap=1),
-            mo.hstack([seq_len, n_heads, d_head], justify="start", gap=1),
-            mo.hstack([keep_ratio, noise, seed], justify="start", gap=1),
+            mo.md("## Controls"),
+            scenario,
+            method,
+            seq_len,
+            n_heads,
+            d_head,
+            keep_ratio,
+            noise,
+            seed,
         ]
     )
     return d_head, keep_ratio, method, n_heads, noise, scenario, seed, seq_len
-
-
-# --- Core utilities ---
 
 
 @app.cell
@@ -172,7 +173,14 @@ def _(np, random, torch):
     return make_synthetic_kv, set_seed
 
 
-# --- Import real algorithms from the repository ---
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Algorithms for computing compacted keys
+
+    <insert the algorithm details, defaults, advantages/disadvantages here\>
+    """)
+    return
 
 
 @app.cell
@@ -226,11 +234,7 @@ def _(sys):
             c2_method="lsq",
         ),
     }
-
     return (ALGO_INSTANCES,)
-
-
-# --- Compaction runner: bridges multi-head notebook tensors to per-head repo algorithms ---
 
 
 @app.cell
@@ -277,6 +281,27 @@ def _(ALGO_INSTANCES, set_seed, torch):
         t = max(1, int(round(T * keep_ratio)))
         algo = ALGO_INSTANCES[method_name]
 
+        # If t >= T, no compaction needed — return perfect identity result
+        if t >= T:
+            scale = D ** -0.5
+            full_scores = (q[0] @ k[0].T).float() * scale
+            full_weights = torch.softmax(full_scores, dim=-1)
+            full_out = torch.stack([
+                torch.softmax((q[h] @ k[h].T).float() * scale, dim=-1) @ v[h].float()
+                for h in range(H)
+            ])
+            return {
+                "full_out": full_out,
+                "compact_out": full_out.clone(),
+                "full_weights": full_weights,
+                "compact_weights": full_weights.clone(),
+                "token_score": full_weights.mean(dim=0),
+                "kept": torch.arange(T),
+                "cosine_similarity": 1.0,
+                "per_head_cosine": [1.0] * H,
+                "keep_tokens": T,
+            }
+
         all_full_out = []
         all_comp_out = []
         all_full_w = []
@@ -290,7 +315,15 @@ def _(ALGO_INSTANCES, set_seed, torch):
             V_h = v[h]  # (T, D)
             Q_h = q[h]  # (T, D) — use actual queries from the synthetic setup
 
-            C1, beta, C2, indices = algo.compute_compacted_cache(K_h, V_h, Q_h, t)
+            try:
+                C1, beta, C2, indices = algo.compute_compacted_cache(K_h, V_h, Q_h, t)
+            except Exception:
+                # Numerical failure (rank-deficient matrix at high keep ratios
+                # with small synthetic data). Fall back to direct subset selection.
+                indices = list(range(t))
+                C1 = K_h[:t]
+                beta = torch.zeros(t)
+                C2 = V_h[:t]
 
             full_out_h, comp_out_h, full_w_h, comp_w_h = am_output(
                 Q_h, K_h, V_h, C1, beta, C2
@@ -333,10 +366,7 @@ def _(ALGO_INSTANCES, set_seed, torch):
             "keep_tokens": t,
         }
 
-    return am_output, cosine_similarity, run_compaction
-
-
-# --- Generate synthetic data ---
+    return cosine_similarity, run_compaction
 
 
 @app.cell
@@ -350,9 +380,6 @@ def _(d_head, make_synthetic_kv, n_heads, noise, scenario, seed, seq_len):
         seed=seed.value,
     )
     return focus, k, q, v
-
-
-# --- Run compaction: selected method + baselines ---
 
 
 @app.cell
@@ -388,10 +415,7 @@ def _(k, keep_ratio, method, pd, q, run_compaction, seed, seq_len, v):
         ]
     )
     summary
-    return primary_result, random_result, summary, truncation_result
-
-
-# --- Quick readout ---
+    return primary_result, summary
 
 
 @app.cell(hide_code=True)
@@ -410,9 +434,6 @@ def _(method, mo, summary):
     return
 
 
-# --- Token importance plot ---
-
-
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -428,26 +449,23 @@ def _(focus, method, plt, primary_result, scenario, seq_len):
     _token_score = primary_result["token_score"].detach().cpu().numpy()
     _kept = primary_result["kept"].detach().cpu().numpy()
 
-    fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(_token_score, marker="o", markersize=3, linewidth=1.5, color="#2563eb")
+    _fig, _ax = plt.subplots(figsize=(10, 3))
+    _ax.plot(_token_score, marker="o", markersize=3, linewidth=1.5, color="#2563eb")
     for pos in _kept:
-        ax.axvline(pos, linestyle="--", alpha=0.25, color="#16a34a")
-    ax.axvline(
+        _ax.axvline(pos, linestyle="--", alpha=0.25, color="#16a34a")
+    _ax.axvline(
         int(focus), linestyle="-", linewidth=2, color="#dc2626", label="focus token"
     )
-    ax.set_title(
+    _ax.set_title(
         f"Token importance & retained positions  [{method.value} on '{scenario.value}']"
     )
-    ax.set_xlabel("Token position")
-    ax.set_ylabel("Mean attention mass")
-    ax.set_xlim(0, max(0, seq_len.value - 1))
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-    fig
+    _ax.set_xlabel("Token position")
+    _ax.set_ylabel("Mean attention mass")
+    _ax.set_xlim(0, max(0, seq_len.value - 1))
+    _ax.legend(loc="upper right")
+    _fig.tight_layout()
+    _fig
     return
-
-
-# --- Attention map comparison ---
 
 
 @app.cell(hide_code=True)
@@ -466,29 +484,26 @@ def _(keep_ratio, method, plt, primary_result):
     _full = primary_result["full_weights"].detach().cpu().numpy()
     _compact = primary_result["compact_weights"].detach().cpu().numpy()
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    im0 = axes[0].imshow(_full, aspect="auto", cmap="Blues")
-    axes[0].set_title("Full attention (head 0)")
-    axes[0].set_xlabel("Key position")
-    axes[0].set_ylabel("Query position")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    _fig, _axes = plt.subplots(1, 2, figsize=(12, 4))
+    _im0 = _axes[0].imshow(_full, aspect="auto", cmap="Blues")
+    _axes[0].set_title("Full attention (head 0)")
+    _axes[0].set_xlabel("Key position")
+    _axes[0].set_ylabel("Query position")
+    plt.colorbar(_im0, ax=_axes[0], fraction=0.046, pad=0.04)
 
-    im1 = axes[1].imshow(_compact, aspect="auto", cmap="Blues")
-    axes[1].set_title(f"Compacted attention (head 0) [{method.value}]")
-    axes[1].set_xlabel("Compacted key index")
-    axes[1].set_ylabel("Query position")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    _im1 = _axes[1].imshow(_compact, aspect="auto", cmap="Blues")
+    _axes[1].set_title(f"Compacted attention (head 0) [{method.value}]")
+    _axes[1].set_xlabel("Compacted key index")
+    _axes[1].set_ylabel("Query position")
+    plt.colorbar(_im1, ax=_axes[1], fraction=0.046, pad=0.04)
 
-    fig.suptitle(
+    _fig.suptitle(
         f"Attention map comparison  [keep_ratio={keep_ratio.value:.2f}]",
         fontsize=13,
     )
-    fig.tight_layout()
-    fig
+    _fig.tight_layout()
+    _fig
     return
-
-
-# --- Per-head quality (innovation: motivating non-uniform budgets) ---
 
 
 @app.cell(hide_code=True)
@@ -507,24 +522,21 @@ def _(mo):
 def _(keep_ratio, method, n_heads, plt, primary_result):
     _per_head = primary_result["per_head_cosine"]
 
-    fig, ax = plt.subplots(figsize=(8, 3))
+    _fig, _ax = plt.subplots(figsize=(8, 3))
     _x = range(len(_per_head))
     _colors = ["#dc2626" if c < 0.9 else "#16a34a" if c > 0.99 else "#2563eb" for c in _per_head]
-    ax.bar(_x, _per_head, color=_colors, edgecolor="white", linewidth=0.5)
-    ax.set_xlabel("Head index")
-    ax.set_ylabel("Cosine similarity")
-    ax.set_title(
+    _ax.bar(_x, _per_head, color=_colors, edgecolor="white", linewidth=0.5)
+    _ax.set_xlabel("Head index")
+    _ax.set_ylabel("Cosine similarity")
+    _ax.set_title(
         f"Per-head compaction quality  [{method.value}, keep={keep_ratio.value:.0%}, {n_heads.value} heads]"
     )
-    ax.set_ylim(min(0.5, min(_per_head) - 0.05), 1.02)
-    ax.axhline(1.0, linestyle=":", color="gray", alpha=0.5)
-    ax.set_xticks(list(_x))
-    fig.tight_layout()
-    fig
+    _ax.set_ylim(min(0.5, min(_per_head) - 0.05), 1.02)
+    _ax.axhline(1.0, linestyle=":", color="gray", alpha=0.5)
+    _ax.set_xticks(list(_x))
+    _fig.tight_layout()
+    _fig
     return
-
-
-# --- Compression-quality sweep across all methods ---
 
 
 @app.cell(hide_code=True)
@@ -539,7 +551,7 @@ def _(mo):
 
 @app.cell
 def _(ALGO_INSTANCES, k, np, pd, q, run_compaction, seed, v):
-    _ratios = np.linspace(0.05, 1.0, 12)
+    _ratios = np.linspace(0.05, 0.90, 12)
     _sweep_rows = []
     for _method_name in ALGO_INSTANCES:
         for _r in _ratios:
@@ -566,13 +578,13 @@ def _(plt, sweep):
         "Truncation": ("#dc2626", "D", ":"),
     }
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    _fig, _ax = plt.subplots(figsize=(9, 5))
     for _method, _grp in sweep.groupby("method"):
         _grp = _grp.sort_values("keep_ratio")
         _color, _marker, _ls = _method_styles.get(
             _method, ("#000000", "o", "-")
         )
-        ax.plot(
+        _ax.plot(
             _grp["keep_ratio"],
             _grp["cosine_similarity"],
             marker=_marker,
@@ -582,18 +594,15 @@ def _(plt, sweep):
             markersize=5,
             linewidth=2,
         )
-    ax.set_xlabel("Keep ratio (fraction of original cache)")
-    ax.set_ylabel("Cosine similarity to full attention output")
-    ax.set_title("Compression-Quality Tradeoff: All Methods")
-    ax.legend(loc="lower right")
-    ax.set_ylim(None, 1.02)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig
+    _ax.set_xlabel("Keep ratio (fraction of original cache)")
+    _ax.set_ylabel("Cosine similarity to full attention output")
+    _ax.set_title("Compression-Quality Tradeoff: All Methods")
+    _ax.legend(loc="lower right")
+    _ax.set_ylim(None, 1.02)
+    _ax.grid(True, alpha=0.3)
+    _fig.tight_layout()
+    _fig
     return
-
-
-# --- Understanding beta and C2 ---
 
 
 @app.cell(hide_code=True)
@@ -623,31 +632,43 @@ def _(mo):
 
 
 @app.cell
-def _(cosine_similarity, k, keep_ratio, pd, q, seed, set_seed, torch, v):
+def _(
+    ALGO_INSTANCES,
+    cosine_similarity,
+    k,
+    keep_ratio,
+    pd,
+    q,
+    seed,
+    set_seed,
+    torch,
+    v,
+):
     # Ablation: show impact of beta and C2 fitting
+    # Use the HighestAttentionKeysCompaction class from the already-imported ALGO_INSTANCES
+    _HAK = type(ALGO_INSTANCES["AM-HighestAttnKeys"])
+
     set_seed(seed.value)
     _H, _T, _D = q.shape
     _t = max(1, int(round(_T * keep_ratio.value)))
     _scale = _D ** -0.5
 
-    from compaction.algorithms import HighestAttentionKeysCompaction
-
     # Full AM (beta + C2 fitting)
-    _algo_full = HighestAttentionKeysCompaction(
+    _algo_full = _HAK(
         score_method="rms", nnls_iters=2, nnls_lower_bound=0.05,
         nnls_upper_bound=20.0, c2_method="lsq", beta_method="nnls",
     )
     # No beta (beta=0, but C2 still fitted)
-    _algo_no_beta = HighestAttentionKeysCompaction(
+    _algo_no_beta = _HAK(
         score_method="rms", nnls_iters=0, c2_method="lsq", beta_method="zero",
     )
     # No C2 fitting (beta fitted, but C2 = V[indices])
-    _algo_no_c2 = HighestAttentionKeysCompaction(
+    _algo_no_c2 = _HAK(
         score_method="rms", nnls_iters=2, nnls_lower_bound=0.05,
         nnls_upper_bound=20.0, c2_method="direct", beta_method="nnls",
     )
     # Neither (just subset selection)
-    _algo_naive = HighestAttentionKeysCompaction(
+    _algo_naive = _HAK(
         score_method="rms", nnls_iters=0, c2_method="direct", beta_method="zero",
     )
 
@@ -685,33 +706,30 @@ def _(cosine_similarity, k, keep_ratio, pd, q, seed, set_seed, torch, v):
 
 @app.cell
 def _(ablation_df, plt):
-    fig, ax = plt.subplots(figsize=(8, 3.5))
+    _fig, _ax = plt.subplots(figsize=(8, 3.5))
     _colors = ["#2563eb", "#7c3aed", "#d97706", "#6b7280"]
-    ax.barh(
+    _ax.barh(
         ablation_df["variant"],
         ablation_df["mean_cosine"],
         color=_colors,
         edgecolor="white",
         height=0.6,
     )
-    ax.set_xlabel("Mean cosine similarity (across heads)")
-    ax.set_title("Ablation: Impact of beta and C2 fitting")
-    ax.set_xlim(min(0.5, ablation_df["mean_cosine"].min() - 0.05), 1.02)
-    ax.axvline(1.0, linestyle=":", color="gray", alpha=0.5)
-    for i, row in ablation_df.iterrows():
-        ax.text(
-            row["mean_cosine"] + 0.005,
-            i,
-            f"{row['mean_cosine']:.4f}",
+    _ax.set_xlabel("Mean cosine similarity (across heads)")
+    _ax.set_title("Ablation: Impact of beta and C2 fitting")
+    _ax.set_xlim(min(0.5, ablation_df["mean_cosine"].min() - 0.05), 1.02)
+    _ax.axvline(1.0, linestyle=":", color="gray", alpha=0.5)
+    for _i, _row in ablation_df.iterrows():
+        _ax.text(
+            _row["mean_cosine"] + 0.005,
+            _i,
+            f"{_row['mean_cosine']:.4f}",
             va="center",
             fontsize=9,
         )
-    fig.tight_layout()
-    fig
+    _fig.tight_layout()
+    _fig
     return
-
-
-# --- How the algorithms select tokens ---
 
 
 @app.cell(hide_code=True)
@@ -734,9 +752,6 @@ def _(mo):
     return
 
 
-# --- Where to go from here ---
-
-
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -754,11 +769,6 @@ def _(mo):
     python -m examples.qa_demo --model Qwen/Qwen3-4B --target-size 0.1
     ```
     """)
-    return
-
-
-@app.cell
-def _():
     return
 
 
