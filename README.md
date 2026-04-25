@@ -1,64 +1,75 @@
-# Compaction
+# Fast KV Compaction via Attention Matching — Interactive Explainer
 
-Code for [Fast KV Compaction via Attention Matching](https://arxiv.org/abs/2602.16284). Attention Matching (AM) compacts a KV cache in latent space by constructing a smaller set of keys and values that reproduce the original attention behavior.
+**Submission for the marimo Notebook Competition 2026.**
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/ad98f32b-dfc6-43d1-84c4-698507b68a2b" alt="Attention Matching" width="600">
-</p>
+By **Ashutosh Srivastava** &nbsp;·&nbsp; [@h4shkat](https://x.com/h4shkat) &nbsp;·&nbsp; [LinkedIn](https://www.linkedin.com/in/ashutosh-srivastava-1bbb0a223/) &nbsp;·&nbsp; [Portfolio](https://h4shk4t.github.io/)
 
-## Repository Layout
+Paper: Zweiger, Fu, Guo, Kim (2026). *Fast KV Compaction via Attention Matching.* [arXiv:2602.16284](https://arxiv.org/abs/2602.16284).
 
-| Path | Purpose |
-| --- | --- |
-| `compaction/` | Core methods (`compaction_methods/`, `algorithms/`), chunking strategies, and query generation helpers. |
-| `evaluation/` | `run_qa_evaluation.py`, `run_reasoning_evaluation.py`, configs, and scoring utilities. |
-| `scripts/` | Shell entry points for main experiments plus plotting and aggregation helpers. |
-| `head_budget_optimization/` | Tools for computing nonuniform head budgets for models. |
-| `models/` | Model-specific generation and caching utilities (Qwen3, Llama, Gemma3). |
-| `examples/` | Demo scripts. |
-| `data/` | Dataset and cached reference generation artifacts. |
+---
 
-### Try Compaction
+## What this is
+
+An interactive walkthrough of the paper's **Attention Matching (AM)** algorithm — the math, the code, and the empirical results — using cached tensors from the actual Qwen3-4B model so every plot and slider responds in real time without needing to load the model.
+
+The dramatic headline: **at 20% of Qwen3-4B's KV cache, the model still answers 6/6 multiple-choice questions correctly and recites the article with ~99% verbatim accuracy** — using only matrix algebra (NNLS + OLS), no gradient descent.
+
+## How to read
+
+Open `notebook.py` in marimo or molab. For the cleanest first read, click the **⋮** menu (top-right) and toggle **"Show code"** off.
+
+All controls live in the **left sidebar**. Drag the **QA keep ratio** slider at the top first — the headline teaser reacts to it live.
+
+## Bundle layout (~27 MB total)
+
+```
+notebook.py                                # the marimo notebook (open this)
+pyproject.toml                             # minimal dependencies
+data/cached_kv/                            # 4 small cache files bundled directly
+  Qwen3-4B_qa_results.pt                   # MCQ + verbatim repeat at 6 ratios (96 KB)
+  Qwen3-4B_task_queries.pt                 # task-prompt Q vectors for Part D (24 MB)
+  Qwen3-4B_layer_heatmap.pt                # Part C layer × ratio quality grid (8 KB)
+  Qwen3-4B_pareto_default.pt               # Part F default Pareto scatter (3 KB)
+                                           # Qwen3-4B.pt (605 MB) — auto-downloaded
+                                           # on first run from the Hugging Face dataset
+                                           # at h4shk4t/fast-kv-compaction-cache.
+head_budget_optimization/head_budgets/     # optimized non-uniform head budget JSON
+compaction/algorithms/                     # the paper's reference compaction algos
+scripts/                                   # one-shot scripts that produced the caches
+                                           # (not needed to run the notebook)
+```
+
+## First-run note (Qwen3-4B.pt)
+
+The largest cache file is 605 MB — over molab's 100 MB single-upload cap. The notebook downloads it on first run from a public Hugging Face dataset (`https://huggingface.co/datasets/h4shk4t/fast-kv-compaction-cache`) into `data/cached_kv/Qwen3-4B.pt`. Expect a one-time 30–60 second wait; subsequent runs use the local cache instantly.
+
+If the download fails (rare; retry first), you can also regenerate the file from scratch with:
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 python3 scripts/extract_kv_cache.py --device mps
+```
+
+## What's in the notebook
+
+- **Headline teaser** — Qwen3-4B 6-MCQ table + word-by-word diff at any ratio (sidebar slider).
+- **Part A** — interactive OMP residual visualization on a tiny synthetic problem.
+- **Part B** — full AM pipeline on toy multi-head KV (live compute, the only non-cached section).
+- **Part C** — real-model per-layer × per-ratio compaction quality heatmap.
+- **Part D** — *same article, different tasks, different compactions* — the novel contribution: a clean visualization of how AM is actually a function of $(K, V, Q_\text{ref})$, not just $(K, V)$. Frames query-conditioned compaction as the natural lever for multi-agent / RAG systems.
+- **Part E** — full per-ratio QA breakdown (which questions break first, verbatim recall vs ratio).
+- **Part F** — speed/quality Pareto reproducing the paper's Figure 1.
+- **β + Cv ablation** — visualization of attention-mass correction + mixture-attention ablation showing why all three pieces matter.
+- **Recap + footer** with paper citation and reproducibility command.
+
+## Reproducing the caches
+
+If you want to regenerate everything from scratch (requires Qwen3-4B + MPS or GPU):
 
 ```bash
-python -m examples.qa_demo --model Qwen/Qwen3-4B --target-size 0.1
+PYTORCH_ENABLE_MPS_FALLBACK=1 python3 scripts/precompute_all.py --device mps
 ```
 
-This prefills a short article, compacts its KV cache to 10% with Attention Matching, and compares QA accuracy before and after. See [`examples/qa_demo.py`](examples/qa_demo.py) for details.
+Total runtime ≈ 2–3 hours on Apple Silicon MPS.
 
-### Evaluate QA Tasks
-Run the evaluator with one or more compaction methods and datasets:
+## Compute requirements
 
-```bash
-python -m evaluation.run_qa_evaluation \
-  --algorithm-config default \
-  --methods original AM-HighestAttnKeys \
-  --dataset-name quality \
-  --n-articles 1 \
-  --compute-stats 1
-```
-
-For
-non-uniform budgets, point `--precomputed-budget-path` to one of the JSON files
-under [`head_budget_optimization/head_budgets/`](head_budget_optimization/head_budgets/).
-
-
-## Development Status
-
-We might continue developing this into a more polished, installable package and are open to contributions. If you're interested in collaborating, feel free to open an issue or PR. See [`TODO`](TODO) for current plans.
-
-## Citation
-
-If you found this work useful, please cite:
-
-```
-@misc{zweiger2026fastkvcompactionattention,
-      title={Fast {KV} Compaction via {Attention Matching}}, 
-      author={Adam Zweiger and Xinghong Fu and Han Guo and Yoon Kim},
-      year={2026},
-      eprint={2602.16284},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2602.16284}, 
-}
-```
+The notebook itself runs on **CPU only** (or MPS if available — none of the cells require it). Memory peak ≈ 1.2 GB while the cached KV tensors are loaded. No GPU needed because the heavy work — running Qwen3-4B forward passes — already happened during cache extraction.
